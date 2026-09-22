@@ -80,14 +80,15 @@ function renderPicks() {
         title.textContent = `${pick.symbol} \u2014 ${pick.holder}`;
         const details = document.createElement("p");
         details.className = "stock-details";
-        details.textContent = `Picked: ${pick.pickedDate ?? "Not set"} \u00b7 Starting price: ${pick.startingPrice === null ? "Not set" : "$" + pick.startingPrice.toFixed(2)}`;
+        const baseline = pick.startingPrice ?? pick.resolvedStartingPrice;
+        details.textContent = `Picked: ${pick.pickedDate ?? "Not set"} \u00b7 Starting price: ${baseline == null ? "Not set" : "$" + baseline.toFixed(2)}${pick.baselineDate ? ` (close ${pick.baselineDate})` : ""}`;
         const quote = document.createElement("p");
         quote.textContent = pick.loading ? "Loading price..." :
             pick.price === null ? "Price unavailable. Try refreshing in a moment." :
-            `Current price: $${pick.price.toFixed(2)}`;
+            `Current price: $${pick.price.toFixed(2)}${pick.priceError ? " (last known; refresh failed)" : ""}`;
         const growth = document.createElement("p");
         growth.textContent = pick.growthPercentage === null
-            ? "Growth unavailable" + (pick.startingPrice === null ? " \u2014 no starting price set." : ".")
+            ? (pick.loading ? "Calculating growth..." : pick.baselineError || pick.priceError || "Waiting for market data.")
             : `Growth: ${pick.growthPercentage >= 0 ? "+" : ""}${pick.growthPercentage.toFixed(2)}%`;
         if (pick.growthPercentage !== null) {
             growth.className = pick.growthPercentage >= 0 ? "growth-positive" : "growth-negative";
@@ -110,8 +111,8 @@ function renderPicks() {
 
 function sortPicks() {
     picks.sort((pickA, pickB) => {
-        const priceA = pickA.price ?? -Infinity;
-        const priceB = pickB.price ?? -Infinity;
+        const priceA = pickA.growthPercentage ?? -Infinity;
+        const priceB = pickB.growthPercentage ?? -Infinity;
 
         return priceA === priceB ? 0 : priceB - priceA;
     });
@@ -121,29 +122,100 @@ function sortPicks() {
 }
 
 async function getStockPrice(pick) {
-    pick.price = null;
-    pick.growthPercentage = null;
+    if (pick.loading) return;
     pick.loading = true;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    pick.priceError = null;
+    pick.baselineError = null;
     try {
-        const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(pick.symbol)}&apikey=${API_KEY}`;
-        const response = await fetch(url, { signal: controller.signal });
-        if (!response.ok) throw new Error("Price request failed");
-        const data = await response.json();
-        const price = Number(data.price);
-        if (!Number.isFinite(price) || price <= 0) throw new Error("Price unavailable");
-        pick.price = price;
-        if (Number.isFinite(pick.startingPrice) && pick.startingPrice > 0) {
-            pick.growthPercentage = ((price - pick.startingPrice) / pick.startingPrice) * 100;
-        }
-    } catch {
-        pick.price = null;
-    } finally {
-        clearTimeout(timeout);
-        pick.loading = false;
-    }
+        pick.price = await latestStockPrice(pick.symbol);
+    } catch (error) { pick.priceError = error.message; }
+    try { pick.resolvedStartingPrice = await pickStartingPrice(pick); }
+    catch (error) { pick.baselineError = error.message; }
+    const baseline = pick.startingPrice ?? pick.resolvedStartingPrice;
+    pick.growthPercentage = Number.isFinite(pick.price) && baseline > 0
+        ? (pick.price - baseline) / baseline * 100 : null;
+    pick.loading = false;
+    sortPicks();
 }
+
+// Deduplicate symbols and pace requests to the provider's basic quota.
+const marketCache = new Map();
+const marketPending = new Map();
+let marketQueue = Promise.resolve();
+const marketRequestTimes = [];
+const QUOTE_TTL = 5 * 60 * 1000;
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function marketRequest(path, historical = false) {
+    const cached = marketCache.get(path);
+    if (cached && (historical || Date.now() - cached.time < QUOTE_TTL)) return Promise.resolve(cached.data);
+    if (marketPending.has(path)) return marketPending.get(path);
+    const request = marketQueue.then(async () => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+            while (marketRequestTimes.length && Date.now() - marketRequestTimes[0] >= 61000) marketRequestTimes.shift();
+            if (marketRequestTimes.length >= 8) await delay(61000 - (Date.now() - marketRequestTimes[0]));
+            marketRequestTimes.push(Date.now());
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 15000);
+            let data, response;
+            try {
+                response = await fetch(`https://api.twelvedata.com/${path}&apikey=${API_KEY}`, { signal: controller.signal });
+                data = await response.json();
+            } finally { clearTimeout(timeout); }
+            if (response.status === 429 || Number(data.code) === 429) {
+                if (attempt === 0) { await delay(61000); continue; }
+                throw new Error("Quote limit reached; try again later.");
+            }
+            if (!response.ok || data.status === "error") throw new Error(data.message || "Market data unavailable.");
+            if (historical ? !data.values?.some(bar => Number(bar.close) > 0) : !(Number(data.price) > 0 && Number.isFinite(Number(data.price)))) {
+                throw new Error("No market price returned for this symbol/date.");
+            }
+            marketCache.set(path, { data, time: Date.now() });
+            return data;
+        }
+    });
+    marketQueue = request.catch(() => {});
+    marketPending.set(path, request);
+    request.finally(() => marketPending.delete(path)).catch(() => {});
+    return request;
+}
+
+async function latestStockPrice(symbol) {
+    const data = await marketRequest(`price?symbol=${encodeURIComponent(symbol)}`);
+    return Number(data.price);
+}
+
+async function pickStartingPrice(pick) {
+    if (Number.isFinite(pick.startingPrice) && pick.startingPrice > 0) return pick.startingPrice;
+    if (!pick.pickedDate) throw new Error("Set a picked date or starting price to calculate growth.");
+    const start = new Date(pick.pickedDate + "T12:00:00Z");
+    start.setUTCDate(start.getUTCDate() - 10);
+    const data = await marketRequest(`time_series?symbol=${encodeURIComponent(pick.symbol)}&interval=1day&start_date=${start.toISOString().slice(0, 10)}&end_date=${pick.pickedDate}T23:59:59&outputsize=11&order=desc`, pick.pickedDate < today());
+    const bar = data.values.filter(bar => bar.datetime.slice(0, 10) <= pick.pickedDate && Number.isFinite(Number(bar.close)) && Number(bar.close) > 0)
+        .sort((a, b) => b.datetime.localeCompare(a.datetime))[0];
+    if (!bar) throw new Error("No close found near the picked date. Enter the starting price manually.");
+    pick.baselineDate = bar.datetime.slice(0, 10);
+    return Number(bar.close);
+}
+
+let marketRefresh = null;
+async function refreshMarketData() {
+    if (marketRefresh) return marketRefresh;
+    const button = document.getElementById("refresh-prices");
+    button.disabled = true;
+    document.getElementById("market-status").textContent = "Updating prices; large lists may take a few minutes.";
+    marketRefresh = Promise.all([...picks.map(getStockPrice), ...portfolio.holdings.map(refreshHoldingPrice)]);
+    renderPicks();
+    try {
+        await marketRefresh;
+        const errors = picks.some(p => p.priceError || p.baselineError) || portfolio.holdings.some(h => holdingQuotes.get(h)?.error);
+        document.getElementById("market-status").textContent = errors
+            ? "Some market data could not be refreshed. Last known values are retained; see each stock for details."
+            : "Prices checked at " + new Date().toLocaleTimeString() + ". Refreshes every 5 minutes while this page is open.";
+    } finally { marketRefresh = null; button.disabled = false; }
+}
+document.getElementById("refresh-prices").addEventListener("click", () => { void refreshMarketData(); });
+setInterval(() => { if (!document.hidden) void refreshMarketData(); }, QUOTE_TTL);
 
 function today() {
     const date = new Date();
